@@ -102,7 +102,7 @@ What #29 fixes is in `CHANGELOG.md`. What it does not fix is below.
 | [#33](https://github.com/YanGusik/laravel-spawn/issues/33) | Laravel's own `scoped()` singletons were never flushed | Container half in #29; a seeder now carries boot-time log context into each request | `RequestLifecycleIsolationTest` |
 | [#34](https://github.com/YanGusik/laravel-spawn/issues/34) | Terminating callbacks accumulate and re-run | The list belongs to the request, in its context; the container keeps only what bootstrap registered | `RequestLifecycleIsolationTest` |
 | [#35](https://github.com/YanGusik/laravel-spawn/issues/35) | `Vite` holds CSP nonce and preloaded assets on a shared singleton | Per-request clone of the boot-time object, render state emptied | `RequestLifecycleIsolationTest` |
-| [#44](https://github.com/YanGusik/laravel-spawn/issues/44) | Every uploaded file is rejected by Symfony's file bag: the extension's `TrueAsync\UploadedFile` is not the class it accepts | `UploadedFiles::convert()` wraps each upload over the temporary file the extension has already written, so nothing is copied, and returns Laravel's `UploadedFile` with the `is_uploaded_file()` check off — the extension parsed the body, so PHP never registered the file | `UploadedFilesTest` |
+| [#44](https://github.com/YanGusik/laravel-spawn/issues/44) | Every uploaded file is rejected by Symfony's file bag: the extension's `TrueAsync\UploadedFile` is not the class it accepts | `UploadedFiles::convert()` wraps each upload over the extension's own temporary file, so nothing is copied, and returns Laravel's `UploadedFile` | `UploadedFilesTest` |
 | [#45](https://github.com/YanGusik/laravel-spawn/issues/45) | The PDO pool is never enabled: worker start-up wrote the pool options through an already switched `AsyncConfig`, so requests read the base configuration and shared one connection | Start-up has two phases — configure, then switch — and the pool options are written in the first; the purge covers every connection bootstrap opened, not the default alone | `DatabasePoolOptionsTest`, `WorkerBootstrapOrderTest` |
 
 ### The one pattern behind half of them
@@ -272,12 +272,12 @@ request is atomic on Linux anyway.
 ### Uploads obey the extension's limits, not `php.ini`
 
 The extension parses the multipart body itself, so `upload_max_filesize`, `post_max_size`
-and `upload_tmp_dir` are never read. Its own limits are compiled in: twenty files a
-request, 100 MiB a file, a hundred fields, and every temporary file goes to `/tmp`. A file
-over the size cap reaches the application as an invalid upload with `UPLOAD_ERR_INI_SIZE`
-and no content; files past the twentieth, and a filename the parser refuses, arrive with
-`UPLOAD_ERR_EXTENSION`. Only HTTP/1.1 parses multipart at all — over HTTP/2 and HTTP/3
-`getFiles()` answers empty whatever the body carries.
+and `upload_tmp_dir` are never read. Its own limits are compiled in: 20 files a request,
+100 MiB a file, 100 fields, and every temporary file is written to `/tmp`. A file over the
+size cap is delivered as an invalid upload with `UPLOAD_ERR_INI_SIZE` and no content; files
+past the twentieth, and a filename the parser refuses, carry `UPLOAD_ERR_EXTENSION`.
+Multipart is parsed by the HTTP/1 parser only: over HTTP/2 and HTTP/3 `getFiles()` returns
+an empty array whatever the body carries.
 
 A field name is taken literally except for a trailing `[]`. `photos[]` becomes a list, and
 `user[avatar]` becomes one key spelled `user[avatar]`, so `$request->file('user.avatar')`
@@ -286,8 +286,8 @@ finds nothing where a PHP-SAPI request would.
 The temporary file belongs to the request: it is unlinked once the request and its upload
 objects are released, which is the end of the handler. The Laravel `UploadedFile` the
 conversion returns holds a path and nothing more, so an upload passed to a queued job or
-kept in a static names a file that is already gone — a handler that needs the bytes
-afterwards has to move or read them while the request is alive.
+held in a static property points at a file that has already been unlinked. A handler that
+needs the bytes afterwards has to move or read them while the request is alive.
 
 ---
 

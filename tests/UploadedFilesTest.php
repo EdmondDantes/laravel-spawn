@@ -20,7 +20,7 @@ class UploadedFilesTest extends TestCase
 
     /* The extension unlinks the temporary files when the native request is destroyed, so the
      * converted uploads are only readable while it is alive. Under the server that is the
-     * handler's scope; here it is the test method's. */
+     * handler's scope; here it is the test instance's, and PHPUnit builds one per method. */
     private ?object $nativeRequest = null;
 
     protected function setUp(): void
@@ -50,7 +50,7 @@ class UploadedFilesTest extends TestCase
 
     /**
      * The upload is wrapped where the extension wrote it, so nothing is copied on the way in.
-     * A copy would double the cost of every upload and leave a second file to delete.
+     * A copy would read and write every byte again, and leave a second file nothing unlinks.
      */
     public function test_the_upload_is_not_copied(): void
     {
@@ -87,8 +87,9 @@ class UploadedFilesTest extends TestCase
     }
 
     /**
-     * A filename the parser refuses arrives as an invalid upload rather than as a fatal error,
-     * and Symfony strips the directory part, so the traversal never reaches the application.
+     * A filename the parser refuses arrives as an invalid upload rather than as a fatal error.
+     * `getClientOriginalName()` strips the directory part; `getClientOriginalPath()` still
+     * returns the submitted name, traversal and all.
      */
     public function test_a_rejected_filename_yields_an_invalid_upload(): void
     {
@@ -106,8 +107,9 @@ class UploadedFilesTest extends TestCase
     }
 
     /**
-     * move() is the path Laravel's store() takes, and it has to work across filesystems: the
-     * extension writes to /tmp, which is a mount of its own in most containers.
+     * move() renames the extension's temporary file in place, and the request's cleanup then
+     * unlinks the path it recorded, so the moved content has to survive that. `store()` takes
+     * another route entirely: it streams a copy through the filesystem adapter.
      */
     public function test_a_stored_upload_keeps_its_content(): void
     {
@@ -161,7 +163,8 @@ class UploadedFilesTest extends TestCase
     }
 
     /**
-     * Parses a multipart body with the extension and returns its native request.
+     * Builds a multipart body, parses it with the extension, and keeps the native request in
+     * `$nativeRequest` so its temporary files outlive the call.
      *
      * @param  list<array{name: string, filename: string, type: string, body: string}>  $parts
      */

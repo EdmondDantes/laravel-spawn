@@ -9,15 +9,15 @@ use TrueAsync\UploadedFile as NativeUploadedFile;
  * Rebuilds the server extension's uploaded files as the objects a Laravel request accepts.
  *
  * Symfony's FileBag takes an array or a Symfony UploadedFile and rejects everything else, so
- * the extension's own class has to be wrapped before the request is constructed. The wrapper
- * points at the temporary file the extension has already written, so an upload of any size
- * costs no copy. That file belongs to the extension and is unlinked when the request ends: a
- * handler that needs the data afterwards has to move it, as it would with a PHP upload.
+ * the extension's own class cannot go into a request as it is.
+ *
+ * The uploads that come back read the extension's temporary file rather than a copy of it,
+ * and that file belongs to the request: it is unlinked when the request ends, so a handler
+ * that needs the bytes afterwards has to move or read them while the request is alive.
  */
 class UploadedFiles
 {
-    /* Refusals by the multipart parser itself. PHP has no constant for them, so they are
-     * reported through the UPLOAD_ERR_* code closest in meaning; see translateError(). */
+    /* Refusals by the multipart parser itself, for which PHP has no constant. */
     private const NATIVE_ERR_TOO_MANY_FILES = 100;
     private const NATIVE_ERR_INVALID_NAME   = 101;
     private const NATIVE_ERR_TOO_LARGE      = 102;
@@ -25,11 +25,10 @@ class UploadedFiles
     /**
      * Converts the array HttpRequest::getFiles() returns.
      *
-     * A field name maps to one file, or to a list of them when the field was named `x[]`;
-     * both shapes are kept. A field the client submitted empty is dropped rather than
-     * reported, which is what PHP's own file bag does with an empty file input, so
-     * `$request->file()` answers null for it. A value that is not an upload of the extension
-     * is returned unchanged.
+     * A field name maps to one file, or to a list of them when the field was named `x[]`, and
+     * both shapes are kept. A field the client submitted empty is left out, so
+     * `$request->file()` answers null for it as it does under a PHP SAPI. A value that is not
+     * an upload of the extension is returned unchanged.
      */
     public static function convert(array $files): array
     {
@@ -72,15 +71,16 @@ class UploadedFiles
 
         $path = $error === UPLOAD_ERR_OK ? self::temporaryPath($file) : null;
 
+        /* Symfony checks that the path exists whenever the error is OK, so an upload whose file
+         * cannot be found is reported unusable rather than left to throw. */
         if ($error === UPLOAD_ERR_OK && $path === null) {
             $error = UPLOAD_ERR_CANT_WRITE;
         }
 
-        /* Two decisions are locked in here. The last argument turns off the is_uploaded_file()
-         * check: the body was parsed by the extension, so PHP's rfc1867 machinery never
-         * registered the file and would call every upload invalid. And the object is Laravel's
-         * subclass rather than Symfony's, because Request::convertUploadedFiles() re-wraps a
-         * Symfony instance with that argument back at false and passes its own subclass
+        /* The last argument turns off the is_uploaded_file() check: the extension parsed the
+         * body, so PHP's rfc1867 machinery never registered the file and the check cannot pass.
+         * The class is Laravel's rather than Symfony's because Request::convertUploadedFiles()
+         * re-wraps a Symfony instance with that check back on, and passes its own subclass
          * through untouched. */
         return new UploadedFile(
             $path ?? '',

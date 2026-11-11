@@ -16,45 +16,65 @@ use Spawn\Laravel\Foundation\RequestContext;
  * Before bootCompleted(): behaves like stock ResponseFactory.
  * After bootCompleted(): per-request state is stored in RequestContext.
  *
- * Isolated state: sharedProps, rootView, version, encryptHistory, urlResolver.
+ * Isolated state: sharedProps, rootView, version, encryptHistory, urlResolver. The five
+ * properties are unset on the shared object, so every read and write Inertia's own methods make
+ * of them — render() among them — reaches __get/__set and the request's state. A render that
+ * suspends, in a version closure that hashes the manifest or in the page check of
+ * `inertia.pages.ensure_pages_exist`, therefore reads its own request's values when it resumes.
  */
 class AsyncResponseFactory extends ResponseFactory
 {
     private const CTX_KEY = 'inertia.state';
 
-    /** The version a render in progress resolved before it built its Response. */
-    private const CTX_RENDERING_VERSION = 'inertia.rendering_version';
+    /** The properties that belong to the request, kept in its InertiaState. */
+    private const REQUEST_STATE = ['sharedProps', 'rootView', 'version', 'encryptHistory', 'urlResolver'];
 
     private bool $async = false;
 
-    /**
-     * What boot configured, captured when async mode starts: each request starts from it.
-     * The properties themselves cannot serve, because render() swaps them.
-     *
-     * @var array{sharedProps: array, rootView: string, version: mixed, encryptHistory: ?bool, urlResolver: ?Closure}
-     */
-    private array $bootState;
+    /** What boot configured, captured when async mode starts: each request starts from a copy of it. */
+    private InertiaState $bootState;
 
     public function bootCompleted(): void
     {
-        $this->bootState = [
-            'sharedProps' => $this->sharedProps,
-            'rootView' => $this->rootView,
-            'version' => $this->version,
-            'encryptHistory' => $this->encryptHistory,
-            'urlResolver' => $this->urlResolver,
-        ];
+        $this->bootState = new InertiaState();
+
+        foreach (self::REQUEST_STATE as $property) {
+            $this->bootState->$property = $this->$property;
+            unset($this->$property);
+        }
+
         $this->async = true;
     }
 
-    private function getState(): array
+    /**
+     * @return mixed a reference into this request's state, so that Inertia's own methods can
+     *   modify its arrays in place
+     */
+    public function &__get(string $name)
+    {
+        $state = $this->getState();
+
+        return $state->$name;
+    }
+
+    public function __set(string $name, mixed $value): void
+    {
+        $this->getState()->$name = $value;
+    }
+
+    public function __isset(string $name): bool
+    {
+        return isset($this->getState()->$name);
+    }
+
+    private function getState(): InertiaState
     {
         $ctx = RequestContext::current();
         $state = $ctx->find(self::CTX_KEY);
 
-        if ($state === null) {
-            $state = $this->bootState;
-            $ctx->set(self::CTX_KEY, $state);
+        if (! $state instanceof InertiaState) {
+            $state = clone $this->bootState;
+            $ctx->set(self::CTX_KEY, $state, replace: true);
         }
 
         return $state;
@@ -62,9 +82,7 @@ class AsyncResponseFactory extends ResponseFactory
 
     private function setState(string $key, mixed $value): void
     {
-        $state = $this->getState();
-        $state[$key] = $value;
-        RequestContext::current()->set(self::CTX_KEY, $state, replace: true);
+        $this->getState()->$key = $value;
     }
 
     public function share($key, $value = null): void
@@ -75,7 +93,7 @@ class AsyncResponseFactory extends ResponseFactory
         }
 
         $state = $this->getState();
-        $shared = $state['sharedProps'];
+        $shared = $state->sharedProps;
 
         if (is_array($key)) {
             $shared = array_merge($shared, $key);
@@ -96,7 +114,7 @@ class AsyncResponseFactory extends ResponseFactory
             return parent::getShared($key, $default);
         }
 
-        $shared = $this->getState()['sharedProps'];
+        $shared = $this->getState()->sharedProps;
 
         if ($key) {
             return Arr::get($shared, $key, $default);
@@ -131,7 +149,7 @@ class AsyncResponseFactory extends ResponseFactory
             return $this->rootView;
         }
 
-        return $this->getState()['rootView'];
+        return $this->getState()->rootView;
     }
 
     public function version($version): void
@@ -150,13 +168,7 @@ class AsyncResponseFactory extends ResponseFactory
             return parent::getVersion();
         }
 
-        $rendering = RequestContext::current()->find(self::CTX_RENDERING_VERSION);
-
-        if ($rendering !== null) {
-            return $rendering;
-        }
-
-        $version = $this->getState()['version'];
+        $version = $this->getState()->version;
 
         if ($version instanceof Closure) {
             $version = app()->call($version);
@@ -183,46 +195,5 @@ class AsyncResponseFactory extends ResponseFactory
         }
 
         $this->setState('urlResolver', $urlResolver);
-    }
-
-    public function render($component, $props = []): Response
-    {
-        if (! $this->async) {
-            return parent::render($component, $props);
-        }
-
-        // Temporarily inject our per-coroutine state into the parent properties
-        // so that parent::render() picks them up correctly across Inertia versions.
-        //
-        // The swap holds only while nothing suspends: a sibling render would swap the same
-        // properties under this one. The version is the part that does — the stock middleware
-        // hashes the manifest file, and file I/O suspends — so it is resolved first, and
-        // parent::render() gets it back from getVersion() without running the closure again.
-        $ctx = RequestContext::current();
-        $ctx->set(self::CTX_RENDERING_VERSION, $this->getVersion(), replace: true);
-
-        $origShared = $this->sharedProps;
-        $origRootView = $this->rootView;
-        $origVersion = $this->version;
-        $origEncrypt = $this->encryptHistory;
-        $origUrl = $this->urlResolver;
-
-        $state = $this->getState();
-        $this->sharedProps = $state['sharedProps'];
-        $this->rootView = $state['rootView'];
-        $this->version = $state['version'];
-        $this->encryptHistory = $state['encryptHistory'];
-        $this->urlResolver = $state['urlResolver'];
-
-        try {
-            return parent::render($component, $props);
-        } finally {
-            $ctx->unset(self::CTX_RENDERING_VERSION);
-            $this->sharedProps = $origShared;
-            $this->rootView = $origRootView;
-            $this->version = $origVersion;
-            $this->encryptHistory = $origEncrypt;
-            $this->urlResolver = $origUrl;
-        }
     }
 }

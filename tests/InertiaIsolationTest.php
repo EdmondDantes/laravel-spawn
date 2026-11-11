@@ -289,4 +289,66 @@ class InertiaIsolationTest extends AsyncTestCase
 
         $this->assertSame(['a' => true, 'b' => false], $results);
     }
+
+    /**
+     * With `inertia.pages.ensure_pages_exist` on, render() asks the view finder for the page
+     * before it builds the Response, and a finder on disk suspends: a concurrent render must
+     * not get into this render's shared props in that window.
+     */
+    public function test_async_factory_render_keeps_its_own_shared_props_across_a_suspending_page_check(): void
+    {
+        $factory = $this->makeFactory(\Spawn\Laravel\Inertia\AsyncResponseFactory::class);
+        $factory->bootCompleted();
+        $this->withSession();
+        app()->instance('config', new Repository([
+            'inertia' => ['devtools' => ['enabled' => false], 'pages' => ['ensure_pages_exist' => true]],
+        ]));
+        app()->instance('inertia.view-finder', new class {
+            public function find(string $component): string
+            {
+                delay($component === 'A' ? 30 : 60);
+
+                return $component;
+            }
+        });
+
+        $results = $this->runParallel([
+            'a' => function () use ($factory) {
+                $factory->share('user', 'Ann');
+
+                return self::sharedPropsOf($factory->render('A'));
+            },
+            'b' => function () use ($factory) {
+                delay(10);
+                $factory->share('user', 'Bob');
+
+                return self::sharedPropsOf($factory->render('B'));
+            },
+        ]);
+
+        $this->assertSame('Ann', $results['a']['user'] ?? null);
+        $this->assertSame('Bob', $results['b']['user'] ?? null);
+    }
+
+    /**
+     * Every property of Inertia's factory is either the request's or the worker's: a release that
+     * adds one makes this fail until it is placed. `componentTransformer` and the static `macros`
+     * are boot configuration; `clearHistory` is not read, clearHistory() goes through the session.
+     */
+    public function test_every_property_of_the_inertia_factory_is_placed(): void
+    {
+        $perRequest = ['encryptHistory', 'rootView', 'sharedProps', 'urlResolver', 'version'];
+        $perWorker = ['clearHistory', 'componentTransformer', 'macros'];
+
+        $properties = array_map(
+            static fn (\ReflectionProperty $property) => $property->getName(),
+            (new \ReflectionClass(ResponseFactory::class))->getProperties()
+        );
+        sort($properties);
+
+        $placed = array_merge($perRequest, $perWorker);
+        sort($placed);
+
+        $this->assertSame($placed, $properties);
+    }
 }
